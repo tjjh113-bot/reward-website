@@ -1,0 +1,471 @@
+<!-- app.js -->
+/* ========= 基本設定 ========= */
+const WEB_APP_URL = (window.APP_CONFIG && window.APP_CONFIG.WEB_APP_URL) || "";
+const AWARD_WRITE_LIMIT = 12;
+/* ========= 排序輔助函式 (新) ========= */
+function getRankValue(rankStr) {
+  if (!rankStr) return 99999;
+  
+  // 權重越低，排越前面
+  const rankOrder = {
+    "金質獎": 10, "金獎": 10,
+    "銀質獎": 20, "銀獎": 20,
+    "銅質獎": 30, "銅獎": 30,
+    
+    "特優": 40,
+    "優等": 50,
+    "甲等": 60,
+    "乙等": 70,
+    "佳作": 80,
+    "入選": 90,
+    
+    "冠軍": 100, "第一名": 100,
+    "亞軍": 200, "第二名": 200,
+    "季軍": 300, "第三名": 300,
+    "第四名": 400,
+    "第五名": 500,
+    "第六名": 600,
+    "第七名": 700,
+    "第八名": 800,
+  };
+  
+  let bestValue = 99999;
+  for (const key in rankOrder) {
+    if (rankStr.includes(key)) {
+      bestValue = Math.min(bestValue, rankOrder[key]);
+    }
+  }
+  return bestValue;
+}
+/* ========= 狀態 & DOM ========= */
+const tb          = document.querySelector("#tb");
+const inputQ      = document.querySelector("#q");
+const btnAdd      = document.querySelector("#btnAdd");
+const btnEmcee    = document.querySelector("#btnEmcee");
+const btnAward    = document.querySelector("#btnAward");
+const btnRefresh  = document.querySelector("#btnRefresh");
+const btnClear    = document.querySelector("#btnClear");
+const connBadge   = document.querySelector("#connBadge");
+
+/* 表單欄位 */
+const cClass  = document.querySelector("#cClass");
+const cSeat   = document.querySelector("#cSeat");
+const cName   = document.querySelector("#cName");
+const cDate   = document.querySelector("#cDate");
+const cReason = document.querySelector("#cReason");
+const cRank   = document.querySelector("#cRank");
+const cAward  = document.querySelector("#cAward");
+
+/* ========= Modal ========= */
+const modal        = document.querySelector("#modal");
+const modalTitle   = document.querySelector("#modalTitle");
+const modalBody    = document.querySelector("#modalBody");
+const modalClose   = document.querySelector("#modalClose");
+
+const copyTextBtn  = document.querySelector("#copyTextBtn");
+const openDocBtn   = document.querySelector("#openDocBtn");
+const openPdfBtn   = document.querySelector("#openPdfBtn");
+if (modalClose) modalClose.onclick = () => modal.classList.remove("active");
+
+/* ========= 小工具 ========= */
+function toast(msg){ alert(msg); }
+function sanitizeFilename(s){
+  return (s || "").replace(/[\s　]+/g,"").replace(/[\/\\\?\%\*\:\|\"\<\>]/g,"").slice(0,60);
+}
+function pick(obj, keys){
+  for (const k of keys){ if (obj[k] != null && String(obj[k]).trim() !== "") return String(obj[k]).trim(); }
+  return "";
+}
+function buildFilenameFromRows(rows){
+  if (!rows || rows.length === 0) return "輸出文件";
+  const r = rows[0];
+  const cls = pick(r, ["班級","class"]);
+  const seat= pick(r, ["座號","seat"]);
+  const rsn = pick(r, ["事由","reason"]);
+  const base= sanitizeFilename(`${cls}${seat}-${rsn}` || "司儀稿");
+  return (rows.length>1) ? `${base}_等${rows.length}筆` : base;
+}
+
+/* ========= 後端 API ========= */
+async function apiPost(formParams){
+  const res = await fetch(WEB_APP_URL, {
+    method:"POST",
+    mode:"cors",
+    cache:"no-store",
+    headers:{ "Content-Type":"application/x-www-form-urlencoded;charset=UTF-8" },
+    body: formParams
+  });
+  const txt = await res.text();
+  try { return JSON.parse(txt); } catch { return { status:"error", message:"非 JSON 回應", raw:txt }; }
+}
+
+/** 敘獎單（試算表+PDF） */
+async function createAwardDoc(rows){
+  const form = new URLSearchParams();
+  form.set("action","create_award_doc");
+  form.set("rows", JSON.stringify(rows));
+  const j = await apiPost(form);
+  if (j && (j.ok || j.status==="success" || j.status==="ok")) {
+    const d = j.data || j;
+    return { ok:true, sheetUrl:d.sheetUrl, pdfUrl:d.pdfUrl, docUrl:d.docUrl, fileName:d.fileName };
+  }
+  throw new Error((j && j.message) || "建立敘獎單失敗");
+}
+
+/** 司儀稿：建立 Google 文件 + PDF（字級約 18px、行距 1.8） */
+async function createEmceeDoc(text){
+  const form = new URLSearchParams();
+  form.set("action","create_emcee_doc");
+  form.set("text", text || "");
+  const j = await apiPost(form);
+  if (j && (j.ok || j.status==="success" || j.status==="ok")) {
+    const d = j.data || j;
+    return { ok:true, docUrl:d.docUrl, pdfUrl:d.pdfUrl, fileName:d.fileName };
+  }
+  throw new Error((j && j.message) || "建立司儀稿文件失敗");
+}
+
+/* ========= 複製文字 ========= */
+async function copyTextToClipboard(text){
+  try{
+    await navigator.clipboard.writeText(text || "");
+    toast("已複製文字到剪貼簿");
+  }catch{
+    const ta = document.createElement("textarea");
+    ta.value = text || "";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+    toast("已複製文字到剪貼簿");
+  }
+}
+
+/* ========= 司儀稿：同場快取 ========= */
+let emceeCache = null; // { text, docUrl, pdfUrl, fileName }
+function resetEmceeCache(){ emceeCache = null; }
+async function ensureEmceeExport(text){
+  if (emceeCache && emceeCache.text === (text||"")) return emceeCache;
+  const out = await createEmceeDoc(text||"");
+  emceeCache = { text: (text||""), ...out };
+  return emceeCache;
+}
+
+/* ========= 預覽 HTML 生成 ========= */
+function buildEmceePreviewHTML(sel){
+  const byReason = {};
+  sel.forEach(r=>{
+    const reason = (r.事由||"").trim();
+    if(!byReason[reason]) byReason[reason] = [];
+    byReason[reason].push(r);
+  });
+  
+  const parts = Object.entries(byReason).map(([reason, list])=>{
+    
+    // ✅ **修正點：在這裡加入排序**
+    list.sort((a, b) => {
+      const rankA = (a.成績 || "").trim();
+      const rankB = (b.成績 || "").trim();
+      return getRankValue(rankA) - getRankValue(rankB);
+    });
+    // ✅ **排序結束**
+    
+    const seg = list.map(x=>{
+      const cls  = x.班級 ? `${x.班級}班` : "";
+      const rank = x.成績 ? `榮獲${x.成績}` : "";
+      return `${cls}${x.姓名}${rank}`;
+    }).join("、");
+    return `${reason}：${seg}，恭請校長頒獎。`;
+  });
+
+  const text = parts.join("\n");
+  const html = `
+    <div class="award-card">
+      <div class="award-title">🏆 頒獎典禮司儀稿（自動彙整）</div>
+      <div class="award-tip">貼到 Google 文件可再微調。</div>
+      <div class="award-desc" style="line-height:1.9">${parts.map(p=>`<p>${p}</p>`).join("")}</div>
+    </div>
+  `;
+  return { html, text };
+}
+
+function buildAwardPreviewHTML(sel){
+  const total = sel.length;
+  const cut = Math.min(total, AWARD_WRITE_LIMIT);
+  const list = sel.slice(0, cut).map(r=>{
+    const cls  = (r.班級||"").trim();
+    const seat = (r.座號||"").trim();
+    const name = (r.姓名||"").trim();
+    const reason = (r.事由||"").trim();
+    const rank = (r.成績||"").trim();
+    const reward = (r.獎懲種類||"").trim();
+    const reasonRank = reason + (rank ? `（${rank}）` : "");
+    const rewardText = reward ? `；建議獎懲：${reward}` : "";
+    return `<li>${cls || "—"}班${seat || "—"}號 ${name || "—"}－${reasonRank || "—"}${rewardText}</li>`;
+  }).join("");
+
+  const tip = total > AWARD_WRITE_LIMIT
+    ? `下列為即將匯入範本的摘要（共 ${total} 筆，將輸出前 ${AWARD_WRITE_LIMIT} 筆）：`
+    : `下列為即將匯入範本的摘要（共 ${total} 筆）：`;
+
+  const html = `
+    <div class="award-card">
+      <div class="award-title">📄 獎懲建議表（預覽）</div>
+      <div class="award-tip">${tip}</div>
+      <div class="award-desc">
+        <ul style="margin:0; padding-left:1.2em; line-height:1.8">${list}</ul>
+      </div>
+    </div>
+  `;
+  return { html };
+}
+
+/* ========= Modal 入口 ========= */
+function openPreviewModal(options){
+  if (!modal || !openDocBtn || !openPdfBtn) { console.error("Modal/Btn 缺少節點"); return; }
+
+  const { type, rows, html, text } = options || {};
+  const filename = buildFilenameFromRows(rows);
+
+  modalTitle.textContent = (type === "emcee") ? "司儀稿（預覽）" : "獎懲建議表（預覽）";
+  modalBody.innerHTML    = html || "";
+  modal.classList.add("active");
+
+  if (copyTextBtn){
+    copyTextBtn.onclick  = null;
+    copyTextBtn.disabled = false;
+    copyTextBtn.title    = "";
+    copyTextBtn.style.display = "";
+  }
+  openDocBtn.onclick = null; openPdfBtn.onclick = null;
+  openDocBtn.disabled = false; openPdfBtn.disabled = false;
+
+  if (type === "emcee"){
+    if (copyTextBtn){
+      copyTextBtn.textContent = "📋 複製文字";
+      copyTextBtn.classList.add("success");
+      copyTextBtn.onclick = () => copyTextToClipboard(text || "");
+      copyTextBtn.style.display = "";
+    }
+    openDocBtn.textContent = "📄 開啟 Google 文件";
+    openPdfBtn.textContent = "📑 匯出 PDF";
+
+    openDocBtn.onclick = async ()=>{
+      try{
+        openDocBtn.disabled = true;
+        const out = await ensureEmceeExport(text || "");
+        if (out && out.docUrl) window.open(out.docUrl, "_blank");
+        else toast("無法取得 Google 文件連結。");
+      }catch(e){ console.error(e); toast("建立文件失敗，請稍後再試。"); }
+      finally{ openDocBtn.disabled = false; }
+    };
+
+    openPdfBtn.onclick = async ()=>{
+      try{
+        openPdfBtn.disabled = true;
+        const out = await ensureEmceeExport(text || "");
+        if (out && out.pdfUrl){
+          const a = document.createElement("a");
+          a.href = out.pdfUrl;
+          a.download = (out.fileName || filename) + ".pdf";
+          document.body.appendChild(a); a.click(); a.remove();
+        } else { toast("無法取得 PDF 連結。"); }
+      }catch(e){ console.error(e); toast("建立 PDF 失敗，請稍後再試。"); }
+      finally{ openPdfBtn.disabled = false; }
+    };
+
+  } else {
+    if (copyTextBtn){
+      copyTextBtn.style.display = "none";
+      copyTextBtn.onclick = null;
+    }
+    openDocBtn.textContent = "📄 匯出試算表";
+    openPdfBtn.textContent = "📑 匯出 PDF";
+
+    openDocBtn.onclick = async ()=>{
+      try{
+        if (options.docUrl || options.sheetUrl) return window.open(options.docUrl || options.sheetUrl, "_blank");
+        openDocBtn.disabled = true;
+        const out = await createAwardDoc(rows.slice(0, AWARD_WRITE_LIMIT));
+        if (out.docUrl || out.sheetUrl) window.open(out.docUrl || out.sheetUrl, "_blank");
+        else toast("無法取得試算表連結。");
+      }catch(e){ console.error(e); toast("建立試算表失敗，請稍後再試。"); }
+      finally{ openDocBtn.disabled = false; }
+    };
+
+    openPdfBtn.onclick = async ()=>{
+      try{
+        openPdfBtn.disabled = true;
+        const out = await createAwardDoc(rows.slice(0, AWARD_WRITE_LIMIT));
+        if (out && out.pdfUrl){
+          const a = document.createElement("a");
+          a.href = out.pdfUrl;
+          a.download = (out.fileName || "獎懲公告") + ".pdf";
+          document.body.appendChild(a); a.click(); a.remove();
+        } else { toast("無法取得 PDF 連結。"); }
+      }catch(e){ console.error(e); toast("建立 PDF 失敗，請稍後再試。"); }
+      finally{ openPdfBtn.disabled = false; }
+    };
+  }
+}
+
+/* ========= 名單渲染 ========= */
+let rows = []; // {id, 班級, 座號, 姓名, 事由, 成績, 獎懲種類, 發生日期}
+
+function render(){
+  const q = (inputQ.value||"").trim().toLowerCase();
+  const list = rows.filter(r=>{
+    if(!q) return true;
+    const s = `${r.班級} ${r.座號} ${r.姓名} ${r.事由} ${r.成績}`.toLowerCase();
+    return s.includes(q);
+  });
+  tb.innerHTML = list.map(r=>`
+    <tr data-id="${r.id}">
+      <td><input class="row-check" type="checkbox"></td>
+      <td>${r.班級||""}</td>
+      <td>${r.座號||""}</td>
+      <td>${r.姓名||""}</td>
+      <td>${r.事由||""}</td>
+      <td>${r.成績||""}</td>
+    </tr>
+  `).join("");
+}
+function getSelectedRows(){
+  const ids = [];
+  tb.querySelectorAll(".row-check").forEach(ck=>{
+    if (ck.checked){ ids.push(ck.closest("tr").dataset.id); }
+  });
+  return rows.filter(r=>ids.includes(r.id));
+}
+
+/* ========= 事件 ========= */
+// NEW: 自動查詢姓名的函式
+async function fetchStudentName() {
+  const cls = cClass.value.trim();
+  const seat = cSeat.value.trim();
+
+  // 必須班級和座號都有值才觸發查詢
+  if (!cls || !seat) {
+    return;
+  }
+  
+  // 如果姓名欄已經有值，且不是被自動填入的，就不覆蓋
+  if (cName.value && !cName.dataset.autoFilled) {
+    return;
+  }
+
+  try {
+    const form = new URLSearchParams();
+    form.set("action", "get_student_name");
+    form.set("class", cls);
+    form.set("seat", seat);
+    
+    const result = await apiPost(form);
+    
+    // 檢查回傳結果是否成功，且有 data.name
+    if (result && result.status === 'success' && result.data && result.data.name) {
+      cName.value = result.data.name;
+      cName.dataset.autoFilled = 'true'; // NEW: 做一個標記，表示是自動填入的
+    } else {
+      // 如果查不到，且之前是自動填入的，就清空
+      if (cName.dataset.autoFilled) {
+          cName.value = '';
+          delete cName.dataset.autoFilled;
+      }
+    }
+  } catch (error) {
+    console.error("查詢姓名時發生錯誤:", error);
+    // 這裡可以選擇性地不跳出提示，避免干擾使用者
+  }
+}
+
+if (btnAdd) btnAdd.onclick = async ()=>{
+  if(!cClass.value || !cSeat.value || !cName.value){ toast("請先填『班級 / 座號 / 姓名』"); return; }
+  const rec = {
+    id: crypto.randomUUID(),
+    班級: cClass.value.trim(),
+    座號: cSeat.value.trim(),
+    姓名: cName.value.trim(),
+    發生日期: (cDate.value||"").trim(),
+    事由: cReason.value.trim(),
+    成績: cRank.value.trim(),
+    獎懲種類: cAward.value.trim()
+  };
+  rows.unshift(rec); render(); resetEmceeCache();
+
+  try{
+    const form = new URLSearchParams();
+    form.set("action","add_record");
+    form.set("id", rec.id);
+    form.set("班級",rec.班級); form.set("座號",rec.座號); form.set("姓名",rec.姓名);
+    form.set("發生日期",rec.發生日期); form.set("事由",rec.事由); form.set("成績", rec.成績);
+    form.set("獎懲種類",rec.獎懲種類);
+    const j = await apiPost(form);
+    if (!(j && (j.ok || j.status==="success"))) toast("已加入名單，但寫入試算表未確認成功。");
+  }catch(e){ console.error(e); toast("已加入名單，但寫入試算表失敗。"); }
+
+  cSeat.value=""; cName.value=""; cReason.value=""; cRank.value="";
+  delete cName.dataset.autoFilled; // NEW: 加入名單後清除標記
+};
+
+if (inputQ) inputQ.oninput  = render;
+if (btnRefresh) btnRefresh.onclick = render;
+if (btnClear) btnClear.onclick = ()=>{ if(!confirm("確定清除目前清單？")) return; rows=[]; render(); resetEmceeCache(); };
+
+// NEW: 幫班級和座號輸入框加上 blur 事件監聽
+if (cClass) cClass.addEventListener('blur', fetchStudentName);
+if (cSeat) cSeat.addEventListener('blur', fetchStudentName);
+// NEW: 如果使用者手動修改姓名，就移除自動填入的標記
+if (cName) cName.addEventListener('input', () => {
+    delete cName.dataset.autoFilled;
+});
+
+if (btnEmcee) btnEmcee.onclick = ()=>{
+  const sel = getSelectedRows();
+  if(!sel.length) return toast("請先勾選至少一筆。");
+  const { html, text } = buildEmceePreviewHTML(sel);
+  openPreviewModal({ type:"emcee", rows:sel, html, text });
+};
+
+if (btnAward) btnAward.onclick = ()=>{
+  const sel = getSelectedRows();
+  if(!sel.length) return toast("請先勾選至少一筆。");
+  if (sel.length > AWARD_WRITE_LIMIT) toast(`目前範本僅寫入第 4–15 列，共 ${AWARD_WRITE_LIMIT} 筆；已選 ${sel.length} 筆，將只輸出前 ${AWARD_WRITE_LIMIT} 筆。`);
+  const { html } = buildAwardPreviewHTML(sel);
+  openPreviewModal({ type:"award", rows:sel, html });
+};
+
+/* ========= 後端連線檢查 ========= */
+async function pingBackend() {
+  if (!connBadge) return;
+  connBadge.classList.remove("success");
+  connBadge.textContent = "後端連線狀態檢查中…";
+  if (!WEB_APP_URL || !/^https?:\/\//i.test(WEB_APP_URL)) { connBadge.textContent = "未設定後端網址"; return; }
+  const withTimeout = (p,ms=5000)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")),ms))]);
+  let ok = false;
+  try{
+    try{
+      const url = WEB_APP_URL + (WEB_APP_URL.includes("?")?"&":"?") + "_t=" + Date.now();
+      await withTimeout(fetch(url,{method:"GET",mode:"no-cors",cache:"no-store"}),5000);
+      ok = true;
+    }catch{}
+    if (!ok){
+      try{
+        const r = await withTimeout(fetch(WEB_APP_URL,{
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action:"ping",_t:Date.now()})
+        }),5000);
+        const j = await r.json().catch(()=>null);
+        ok = j && (j.ok || j.status==="success" || j.status==="ok");
+      }catch{}
+    }
+  }catch{}
+  if (ok){ connBadge.textContent = "後端連線成功"; connBadge.classList.add("success"); }
+  else   { connBadge.textContent = "後端連線失敗"; connBadge.classList.remove("success"); }
+}
+if (connBadge) connBadge.addEventListener("click", pingBackend);
+
+/* ========= 啟動 ========= */
+render();
+pingBackend();
